@@ -1,28 +1,36 @@
-// test.js (corrigido)
-// eslint-disable-next-line no-console
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "0";
+/* eslint-disable no-console */
+process.env.NODE_TLS_REJECT_UNAUTHORIZED =
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "0";
 
+const fs = require("fs");
 const fetch = require("node-fetch");
 const { URL } = require("url");
 const AbortController = global.AbortController || require("abort-controller");
 
-// ===== Parâmetros (alinhados ao site) =====
-const DOWNLOAD_DURATION_SEC = 15;
-const DOWNLOAD_STREAMS = 10;
-const CHUNK_SIZE_MB = 20;         // /download/20
-const UPLOAD_DURATION_SEC = 15;
-const UPLOAD_STREAMS = 3;
-const PING_SAMPLES = 20;
+// ===== CLI =====
+const argv = process.argv.slice(2).reduce((acc, a) => {
+  const [k, v] = a.includes("=") ? a.split("=") : [a, true];
+  const key = k.replace(/^--/, "");
+  acc[key] = v === true ? true : isNaN(v) ? v : Number(v);
+  return acc;
+}, {});
 
-const SINGLE_REQ_TIMEOUT_MS = 15000;  // ↑ aumentamos pra 15s
-const GLOBAL_TIMEOUT_MS = 3 * 60 * 1000;
+// ===== Parâmetros (defaults do site; podem ser alterados por CLI) =====
+const DOWNLOAD_DURATION_SEC = argv.down ?? 15;
+const DOWNLOAD_STREAMS      = argv.streamsDown ?? 10;
+const CHUNK_SIZE_MB         = argv.chunkMB ?? 20;
 
-// ===== Descoberta (STINFO) =====
-const STINFO_BASE = "https://speedtest.eaqbr.com.br:8443";
-const GET_RESUME_PATH = "/stinfo-isp/v1/web/device/get-resume";
-const BASIC_AUTH = "Basic d3A6JDJhJDEwJG1iUkJBS1hmd3NtcENDVnJpdDkwY2VDQU5JcDVqWXVaM3pTMTljOE9MSmJtYkpkN0tTMUky";
+const UPLOAD_DURATION_SEC   = argv.up ?? 15;
+const UPLOAD_STREAMS        = argv.streamsUp ?? 3;
 
-// ===== Cabeçalhos “de navegador” (usamos em tudo) =====
+const PING_SAMPLES          = argv.pings ?? 20;
+const SINGLE_REQ_TIMEOUT_MS = argv.reqTimeoutMs ?? 15000;
+const GLOBAL_TIMEOUT_MS     = argv.globalTimeoutMs ?? 3 * 60 * 1000;
+
+const FORCE_HOST  = argv.host || null;                 // ex: --host=sp-axpot-oi.eaqbr.com.br
+const FORCE_PROTO = argv.http ? "http" : (argv.https ? "https" : null); // --http ou --https
+
+// ===== Cabeçalhos “de navegador” =====
 const COMMON_HEADERS = {
   "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
   "Accept": "*/*",
@@ -30,21 +38,24 @@ const COMMON_HEADERS = {
   "Referer": "https://www.brasilbandalarga.com.br/",
   "Cache-Control": "no-cache",
   "Pragma": "no-cache",
-  "Connection": "keep-alive"
+  "Connection": "keep-alive",
 };
 
 // ===== Utils =====
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-function nowMs(){ return Date.now(); }
-function mbps(bytes, sec){ return (bytes * 8) / (sec * 1024 * 1024); }
-function fmtMB(b){ return (b/(1024*1024)).toFixed(2); }
-function fmtMs(v){ return Number.isFinite(v) ? Math.round(v) : 0; }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const nowMs = () => Date.now();
+const mbps  = (bytes, sec) => (bytes * 8) / (sec * 1024 * 1024);
+const fmtMB = (b) => (b / (1024 * 1024)).toFixed(2);
+const fmtMs = (v) => Number.isFinite(v) ? Math.round(v) : 0;
+
 function deadlineAfter(ms){
-  const id = setTimeout(()=>{ console.error("⏱️  Timeout global (3 min)."); process.exit(2); }, ms);
+  const id = setTimeout(()=>{
+    console.error("⏱️  Timeout global atingido. Encerrando.");
+    process.exit(2);
+  }, ms);
   return ()=>clearTimeout(id);
 }
 
-// fetch com timeout
 function withTimeout(executor, ms, label="request"){
   const ctrl = new AbortController();
   const t = setTimeout(()=>ctrl.abort(), ms);
@@ -72,7 +83,6 @@ async function fetchHead(url, to=SINGLE_REQ_TIMEOUT_MS, label="HEAD"){
   }, to, label);
 }
 
-// stream: soma bytes conforme chegam
 async function fetchAndCountBytes(url, opts={}, to=SINGLE_REQ_TIMEOUT_MS, label="GET"){
   return withTimeout(async (signal)=>{
     const res = await fetch(url, { ...opts, headers: { ...COMMON_HEADERS, ...(opts.headers||{}) }, signal });
@@ -86,15 +96,39 @@ async function fetchAndCountBytes(url, opts={}, to=SINGLE_REQ_TIMEOUT_MS, label=
   }, to, label);
 }
 
-// ===== Descobrir servidores via STINFO =====
-async function discoverServers(){
+// ===== 0) Autenticação dinâmica (lê da home) =====
+// Lê STINFO_BACK_AUTH e STINFO_BASE_URL do HTML da home.
+// Monta Authorization: Basic base64("wp:...") automaticamente.
+async function getSiteConfig() {
+  const HOME = "https://www.brasilbandalarga.com.br/";
+  const html = await withTimeout(
+    (signal) => fetch(HOME, { headers: { ...COMMON_HEADERS }, signal }).then(r => r.text()),
+    12000,
+    "home"
+  );
+
+  const authMatch = html.match(/STINFO_BACK_AUTH\s*=\s*"([^"]+)"/);
+  const baseMatch = html.match(/STINFO_BASE_URL\s*=\s*"([^"]+)"/);
+
+  if (!authMatch) throw new Error("Não achei STINFO_BACK_AUTH na home");
+  const rawAuth = authMatch[1]; // ex.: wp:$2a$10$...
+  const basic   = "Basic " + Buffer.from(rawAuth).toString("base64");
+
+  const baseURL = baseMatch ? baseMatch[1] : "https://speedtest.eaqbr.com.br:8443";
+
+  return { basicAuth: basic, stinfoBaseUrl: baseURL };
+}
+
+// ===== 1) Descobrir servidores via STINFO =====
+async function discoverServers(auth, stinfoBaseUrl){
   console.log("🌐  1) Descobrindo servidores (STINFO:get-resume) …");
-  const url = `${STINFO_BASE}${GET_RESUME_PATH}?t2=${Math.random()}`;
+  const GET_RESUME_PATH = "/stinfo-isp/v1/web/device/get-resume";
+  const url  = `${stinfoBaseUrl}${GET_RESUME_PATH}?t2=${Math.random()}`;
   const body = { srvTp:"WST", appVs:"3.0.0", pltf:"W", loc:"0,0" };
 
   const data = await fetchJSON(url, {
     method:"POST",
-    headers: { "Authorization": BASIC_AUTH, "Content-Type":"application/json", "Accept":"application/json" },
+    headers: { "Authorization": auth, "Content-Type":"application/json", "Accept":"application/json" },
     body: JSON.stringify(body)
   }, SINGLE_REQ_TIMEOUT_MS, "get-resume");
 
@@ -110,7 +144,7 @@ async function discoverServers(){
 }
 
 function protoCandidates(base){
-  // get-resume vem “http://host”; tentamos HTTPS e caímos para HTTP se precisar
+  // get-resume frequentemente retorna "http://host"
   const u = new URL(base);
   const httpsTry = new URL(base); httpsTry.protocol = "https:";
   return [httpsTry.toString().replace(/\/+$/,""), base.replace(/\/+$/,"")];
@@ -131,6 +165,15 @@ async function rttToBase(base){
 
 async function chooseBestServer(all){
   console.log("🧭  2) Selecionando melhor servidor por RTT …");
+
+  // Se o usuário forçou host/proto por CLI, usa e sai
+  if (FORCE_HOST) {
+    const proto = FORCE_PROTO || "https";
+    const url = `${proto}://${FORCE_HOST}`.replace(/\/+$/,"");
+    console.log(`🧭  Servidor forçado: ${FORCE_HOST} (${proto.toUpperCase()})`);
+    return { url, rtt: 0, ok: true, label: "forçado", proto: `${proto}:` };
+  }
+
   const sample = all.slice(0, Math.max(8, Math.min(12, all.length)));
   console.log(`🔎  Medindo RTT em ${sample.length} servidores…`);
   let best = null;
@@ -144,7 +187,7 @@ async function chooseBestServer(all){
     } else {
       console.log(`   • ${host} → falha`);
     }
-    await sleep(30);
+    await sleep(25);
   }
   if (!best) throw new Error("Nenhum servidor respondeu RTT");
   const proto = (best.proto || "").replace(":","").toUpperCase();
@@ -152,7 +195,7 @@ async function chooseBestServer(all){
   return best;
 }
 
-// ===== Ping / Jitter / Perda =====
+// ===== 3) Ping / Jitter / Perda =====
 async function measurePing(baseURL){
   console.log("🏓  3) Medindo latência/jitter/perda …");
   const arr = [];
@@ -164,7 +207,7 @@ async function measurePing(baseURL){
       arr.push(nowMs()-t0);
     } catch { lost++; }
     process.stdout.write(`   [${i}/${PING_SAMPLES}] ${arr[arr.length-1] ?? "timeout"} ms\r`);
-    await sleep(25);
+    await sleep(20);
   }
   process.stdout.write("\n");
   const avg = arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : Infinity;
@@ -174,7 +217,7 @@ async function measurePing(baseURL){
   return { ping:avg, jitter:jit, lossPct };
 }
 
-// ===== Download (stream, com headers e timeout maior) =====
+// ===== 4) Download =====
 async function measureDownload(baseURL){
   console.log("⬇️  4) Medindo DOWNLOAD …");
   console.log(`⬇️  Download: ${DOWNLOAD_STREAMS} fluxos, ${DOWNLOAD_DURATION_SEC}s, caminho /download/${CHUNK_SIZE_MB} …`);
@@ -204,10 +247,10 @@ async function measureDownload(baseURL){
   const speed = mbps(totalBytes, elapsedSec);
   process.stdout.write("\n");
   console.log(`   → total: ${fmtMB(totalBytes)} MB em ${elapsedSec}s | média: ${speed.toFixed(2)} Mbps`);
-  return speed;
+  return { bytes: totalBytes, mbps: speed };
 }
 
-// ===== Upload (headers iguais ao site) =====
+// ===== 5) Upload =====
 async function measureUpload(baseURL){
   console.log("⬆️  5) Medindo UPLOAD …");
   console.log(`⬆️  Upload: ${UPLOAD_STREAMS} fluxos, ${UPLOAD_DURATION_SEC}s, posts pequenos repetidos…`);
@@ -220,7 +263,7 @@ async function measureUpload(baseURL){
   const headers = {
     ...COMMON_HEADERS,
     "Content-Type": "application/x-www-form-urlencoded",
-    "Content-Encoding": "identity"
+    "Content-Encoding": "identity",
   };
 
   async function worker(id){
@@ -244,26 +287,39 @@ async function measureUpload(baseURL){
   const speed = mbps(totalBytes, elapsedSec);
   process.stdout.write("\n");
   console.log(`   → total: ${fmtMB(totalBytes)} MB em ${elapsedSec}s | média: ${speed.toFixed(2)} Mbps`);
-  return speed;
+  return { bytes: totalBytes, mbps: speed };
 }
 
 // ===== Main =====
 (async ()=>{
   const cancel = deadlineAfter(GLOBAL_TIMEOUT_MS);
   try{
-    const { all, ispOrg, ip, reg } = await discoverServers();
+    // 0) Autenticação dinâmica
+    const { basicAuth, stinfoBaseUrl } = await getSiteConfig();
+
+    // 1) Descoberta
+    const { all, ispOrg, ip, reg } = await discoverServers(basicAuth, stinfoBaseUrl);
+
+    // 2) Escolha do servidor
     const best = await chooseBestServer(all);
     const baseURL = best.url;
 
+    // 3) Ping/Jitter/Perda
     const pingStats = await measurePing(baseURL);
+
+    // 4) Download
     const dl = await measureDownload(baseURL);
+
+    // 5) Upload
     const ul = await measureUpload(baseURL);
 
+    // Resumo
     console.log("\n✅  RESUMO");
     console.log(`   Servidor: ${new URL(baseURL).host} (${new URL(baseURL).protocol.replace(":","").toUpperCase()}) — ${best.label}`);
     console.log(`   Ping médio: ${fmtMs(pingStats.ping)} ms | Jitter: ${fmtMs(pingStats.jitter)} ms | Perda: ${pingStats.lossPct.toFixed(0)}%`);
-    console.log(`   Download: ${dl.toFixed(2)} Mbps | Upload: ${ul.toFixed(2)} Mbps\n`);
+    console.log(`   Download: ${dl.mbps.toFixed(2)} Mbps | Upload: ${ul.mbps.toFixed(2)} Mbps\n`);
 
+    // JSON/CSV
     const out = {
       timestamp: new Date().toISOString(),
       isp: { ip, org: ispOrg },
@@ -272,10 +328,35 @@ async function measureUpload(baseURL){
       latency_ms: fmtMs(pingStats.ping),
       jitter_ms: fmtMs(pingStats.jitter),
       packet_loss_pct: +pingStats.lossPct.toFixed(2),
-      download_mbps: +dl.toFixed(2),
-      upload_mbps: +ul.toFixed(2)
+      download_mbps: +dl.mbps.toFixed(2),
+      upload_mbps: +ul.mbps.toFixed(2),
+      download_bytes: dl.bytes,
+      upload_bytes: ul.bytes,
+      params: {
+        downSec: DOWNLOAD_DURATION_SEC,
+        upSec: UPLOAD_DURATION_SEC,
+        streamsDown: DOWNLOAD_STREAMS,
+        streamsUp: UPLOAD_STREAMS,
+        chunkMB: CHUNK_SIZE_MB
+      }
     };
-    console.log(JSON.stringify(out, null, 2));
+
+    // Salva JSON
+    fs.writeFileSync("result.json", JSON.stringify(out, null, 2));
+
+    // Salva/append CSV
+    const csvPath = "results.csv";
+    if (!fs.existsSync(csvPath)) {
+      fs.writeFileSync(
+        csvPath,
+        "timestamp,host,protocol,download_mbps,upload_mbps,latency_ms,jitter_ms,packet_loss_pct,down_sec,up_sec,streams_down,streams_up,chunk_mb\n"
+      );
+    }
+    fs.appendFileSync(
+      csvPath,
+      `${out.timestamp},${out.server.host},${out.server.protocol},${out.download_mbps},${out.upload_mbps},${out.latency_ms},${out.jitter_ms},${out.packet_loss_pct},${DOWNLOAD_DURATION_SEC},${UPLOAD_DURATION_SEC},${DOWNLOAD_STREAMS},${UPLOAD_STREAMS},${CHUNK_SIZE_MB}\n`
+    );
+    console.log("💾  Salvo em result.json e results.csv");
   } catch(e){
     console.error("❌  Falha:", e.message || e);
     process.exit(1);
