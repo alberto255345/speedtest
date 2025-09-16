@@ -1,331 +1,328 @@
-/**
- * Teste EAQ/BBL sem navegador — com LOG passo-a-passo no terminal
- * - Descobre servidores via /stinfo-isp/.../get-resume (Authorization Basic igual ao site)
- * - Seleciona melhor servidor por RTT (HTTPS; cai para HTTP se necessário)
- * - Mede ping/jitter/perda com progresso
- * - Mede download/upload com pequenos pacotes em paralelo + progresso por segundo
- * - Timeout geral: 3 minutos
- *
- * Aviso: desabilita verificação TLS (somente para testes locais).
- */
+// test.js
+/* eslint-disable no-console */
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "0";
 
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"; // ATENÇÃO: apenas para teste
-const https = require("https");
 const fetch = require("node-fetch");
+const { URL } = require("url");
+const AbortController = global.AbortController || require("abort-controller");
 
-// ===== Config base =====
-const ORIGIN  = "https://www.brasilbandalarga.com.br";
-const REFERER = "https://www.brasilbandalarga.com.br/";
+// ==== Parâmetros alinhados ao site ====
+const DOWNLOAD_DURATION_SEC = 15;
+const DOWNLOAD_STREAMS = 10;
+const CHUNK_SIZE_MB = 20;
+const UPLOAD_DURATION_SEC = 15;
+const UPLOAD_STREAMS = 3;
+const PING_SAMPLES = 20;            // menor que 100 pra ser mais ágil
+const SINGLE_REQ_TIMEOUT_MS = 5000; // timeout por request
+const GLOBAL_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutos
+
+// ==== Endpoints do back de descoberta ====
 const STINFO_BASE = "https://speedtest.eaqbr.com.br:8443";
 const GET_RESUME_PATH = "/stinfo-isp/v1/web/device/get-resume";
 
-// Authorization igual ao que você capturou no curl:
-const STINFO_AUTH_B64 = "Basic d3A6JDJhJDEwJG1iUkJBS1hmd3NtcENDVnJpdDkwY2VDQU5JcDVqWXVaM3pTMTljOE9MSmJtYkpkN0tTMUky";
+// Credencial Basic que o site usa (você mesma coletou)
+const BASIC_AUTH =
+  "Basic d3A6JDJhJDEwJG1iUkJBS1hmd3NtcENDVnJpdDkwY2VDQU5JcDVqWXVaM3pTMTljOE9MSmJtYkpkN0tTMUky";
 
-// Ajustes de teste (pode alterar por CLI: --down=15 --up=12 --streamsDown=6 --streamsUp=4)
-const DEFAULTS = {
-  pingCount: 12,
-  downDuration: 15,    // segundos
-  upDuration: 12,      // segundos
-  streamsDown: 6,
-  streamsUp: 4,
-  uploadChunkKB: 256,  // tamanho do bloco de upload
-  perReqTimeoutMs: 7000,
-  globalTimeoutMs: 180000, // 3 minutos
-};
-
-const args = parseArgs(process.argv.slice(2));
-const agent = new https.Agent({ rejectUnauthorized: false });
-const baseHeaders = {
-  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-  "Origin": ORIGIN,
-  "Referer": REFERER,
-  "Cache-Control": "no-cache"
-};
-
-// ===== Util =====
-function parseArgs(argv) {
-  const out = {};
-  for (const a of argv) {
-    if (a.startsWith("--host=")) out.host = a.split("=")[1];
-    else if (a === "--http") out.forceProto = "http";
-    else if (a === "--https") out.forceProto = "https";
-    else if (a.startsWith("--down=")) out.downDuration = +a.split("=")[1] || DEFAULTS.downDuration;
-    else if (a.startsWith("--up=")) out.upDuration = +a.split("=")[1] || DEFAULTS.upDuration;
-    else if (a.startsWith("--streamsDown=")) out.streamsDown = +a.split("=")[1] || DEFAULTS.streamsDown;
-    else if (a.startsWith("--streamsUp=")) out.streamsUp = +a.split("=")[1] || DEFAULTS.streamsUp;
-  }
-  return out;
+// helper: timeout
+function withTimeout(promise, ms, label) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  const wrapped = promise(ctrl.signal)
+    .finally(() => clearTimeout(t))
+    .catch((e) => {
+      if (e.name === "AbortError") throw new Error(`${label || "request"}: timeout`);
+      throw e;
+    });
+  return wrapped;
 }
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-function deadlineAfter(ms) {
-  const id = setTimeout(() => {
-    console.error("⏱️  Timeout geral atingido (3 minutos). Abortando.");
-    process.exit(2);
-  }, ms);
-  return () => clearTimeout(id);
-}
-function fmtMbps(v){ return Number.isFinite(v) ? Number(v).toFixed(2) : "0.00"; }
-function fmtMB(bytes){ return (bytes/(1024*1024)).toFixed(2); }
-function fmtMs(v){ return Number.isFinite(v) ? Math.round(v) : 0; }
-function nowISO(){ return new Date().toISOString(); }
 
-async function fetchWithTimeout(url, { timeoutMs = 8000, headers = {}, ...opts } = {}) {
-  const controller = new AbortController();
-  const to = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...opts, headers: { ...baseHeaders, ...headers }, agent, signal: controller.signal });
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchJSON(url, opts = {}, singleTimeout = SINGLE_REQ_TIMEOUT_MS, label = "fetch") {
+  return withTimeout(async (signal) => {
+    const res = await fetch(url, { ...opts, signal });
+    if (!res.ok) throw new Error(`${label} HTTP ${res.status}`);
+    return res.json();
+  }, singleTimeout, label);
+}
+
+async function fetchBuffer(url, opts = {}, singleTimeout = SINGLE_REQ_TIMEOUT_MS, label = "fetch") {
+  return withTimeout(async (signal) => {
+    const res = await fetch(url, { ...opts, signal });
+    if (!res.ok) throw new Error(`${label} HTTP ${res.status}`);
+    return res.arrayBuffer();
+  }, singleTimeout, label);
+}
+
+async function head(url, singleTimeout = SINGLE_REQ_TIMEOUT_MS, label = "head") {
+  return withTimeout(async (signal) => {
+    const res = await fetch(url, { method: "HEAD", signal });
+    if (!res.ok) throw new Error(`${label} HTTP ${res.status}`);
     return res;
-  } finally {
-    clearTimeout(to);
-  }
-}
-async function jsonPost(url, body, headers = {}, timeoutMs = 12000) {
-  const res = await fetchWithTimeout(url, {
-    timeoutMs,
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...headers },
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} em ${url}`);
-  return res.json();
+  }, singleTimeout, label);
 }
 
-// ===== STINFO: descoberta =====
-async function getResume() {
+function nowMs() {
+  return Date.now();
+}
+
+function mbps(bytes, elapsedSec) {
+  return (bytes * 8) / (elapsedSec * 1024 * 1024);
+}
+
+function pickProto(hostBaseUrl) {
+  // O get-resume vem com "http://..." — o site sobe pra https em runtime quando está em https.
+  // Aqui tentamos HTTPS primeiro, depois caímos pra HTTP se falhar.
+  const u = new URL(hostBaseUrl);
+  if (u.protocol === "http:") {
+    const httpsTry = new URL(hostBaseUrl);
+    httpsTry.protocol = "https:";
+    return [httpsTry.toString().replace(/\/+$/, ""), hostBaseUrl.replace(/\/+$/, "")];
+  }
+  return [hostBaseUrl.replace(/\/+$/, "")];
+}
+
+async function discoverServers() {
   const url = `${STINFO_BASE}${GET_RESUME_PATH}?t2=${Math.random()}`;
   const body = { srvTp: "WST", appVs: "3.0.0", pltf: "W", loc: "0,0" };
-  return jsonPost(url, body, { Authorization: STINFO_AUTH_B64, Accept: "application/json" }, 15000);
+
+  console.log("🌐  1) Descobrindo servidores (STINFO:get-resume) …");
+  const data = await fetchJSON(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": BASIC_AUTH,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": "https://www.brasilbandalarga.com.br",
+        "Referer": "https://www.brasilbandalarga.com.br/",
+      },
+      body: JSON.stringify(body),
+    },
+    SINGLE_REQ_TIMEOUT_MS,
+    "get-resume"
+  );
+
+  const ispOrg = data?.isp?.as?.org?.name || data?.isp?.as?.org?.label || "n/a";
+  const ip = data?.isp?.ip?.number || "n/a";
+  const reg = data?.geo?.address || "n/a";
+
+  const onnet = (data?.ptts?.onnet || []).map((row) => ({ base: row[0], label: row[1], onnet: true }));
+  const offnet = (data?.ptts?.offnet || []).map((row) => ({ base: row[0], label: row[1], onnet: false }));
+  console.log(`   ISP: ${ispOrg} | IP: ${ip} | Região: ${reg}`);
+  console.log(`   Servidores retornados: on/off = ${onnet.length}/${offnet.length}`);
+
+  return { onnet, offnet, ispOrg, ip, reg };
 }
-function extractHostsFromResume(resume) {
-  const entries = [];
-  const addGroup = (arr, group) => {
-    if (!Array.isArray(arr)) return;
-    for (const item of arr) {
-      if (!Array.isArray(item) || !item[0]) continue;
-      try {
-        const u = new URL(item[0]);
-        entries.push({ host: u.host, label: item[1] || group });
-      } catch {}
+
+async function rttToBase(base) {
+  const tries = pickProto(base);
+  const path = "/?r=" + Math.random();
+  const start = nowMs();
+  for (const candidate of tries) {
+    try {
+      await head(candidate + path, 1500, "rtt");
+      return { url: candidate, rtt: nowMs() - start, ok: true, proto: new URL(candidate).protocol };
+    } catch (_) {
+      // tenta próximo proto
     }
-  };
-  addGroup(resume?.ptts?.onnet, "onnet");
-  addGroup(resume?.ptts?.offnet, "offnet");
-  return entries;
+  }
+  return { url: tries[0], rtt: Infinity, ok: false, proto: new URL(tries[0]).protocol };
 }
 
-// ===== Seleção de servidor =====
-async function timeGet(url, timeoutMs = 2500) {
-  const t0 = Date.now();
-  try {
-    const res = await fetchWithTimeout(url, { timeoutMs, method: "GET" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return Date.now() - t0;
-  } catch { return null; }
-}
-async function probeHostBestProtoVerbose(host, forceProto) {
-  if (forceProto === "https") {
-    const rtt = await timeGet(`https://${host}/?r=${Math.random()}`, 2500);
-    console.log(`   • Testando ${host} via HTTPS → ${rtt === null ? "falha" : rtt+" ms"}`);
-    return rtt !== null ? { host, proto: "https", rtt } : null;
-  }
-  if (forceProto === "http") {
-    const rtt = await timeGet(`http://${host}/?r=${Math.random()}`, 2500);
-    console.log(`   • Testando ${host} via HTTP → ${rtt === null ? "falha" : rtt+" ms"}`);
-    return rtt !== null ? { host, proto: "http", rtt } : null;
-  }
-  // Tenta HTTPS; se falhar, HTTP
-  let rtt = await timeGet(`https://${host}/?r=${Math.random()}`, 2500);
-  console.log(`   • ${host} HTTPS → ${rtt === null ? "falha" : rtt+" ms"}`);
-  if (rtt !== null) return { host, proto: "https", rtt };
+async function chooseBestServer(all) {
+  console.log("🧭  2) Selecionando melhor servidor por RTT …");
+  const sample = [...all].slice(0, Math.max(8, Math.min(12, all.length))); // 8–12 primeiros
+  console.log(`🔎  Medindo RTT em ${sample.length} servidores…`);
 
-  rtt = await timeGet(`http://${host}/?r=${Math.random()}`, 2500);
-  console.log(`     ↳ ${host} HTTP  → ${rtt === null ? "falha" : rtt+" ms"}`);
-  if (rtt !== null) return { host, proto: "http", rtt };
-  return null;
-}
-async function selectBestServerDynamic(entries, forceProto) {
-  console.log(`🔎  Medindo RTT em ${entries.length} servidores…`);
-  const samples = [];
-  for (const e of entries) {
-    const p = await probeHostBestProtoVerbose(e.host, forceProto);
-    if (p) samples.push({ ...p, label: e.label });
-    await sleep(40);
+  let best = null;
+  for (const s of sample) {
+    const res = await rttToBase(s.base);
+    if (res.ok) {
+      console.log(`   • ${new URL(res.url).host} ${res.proto.toUpperCase()} → ${res.rtt} ms`);
+      if (!best || res.rtt < best.rtt) best = { ...res, label: s.label };
+    } else {
+      // tenta HTTP fallback explicitamente
+      const httpURL = new URL(s.base); httpURL.protocol = "http:";
+      try {
+        const t0 = nowMs();
+        await head(httpURL.toString() + "/?r=" + Math.random(), 1500, "rtt-fallback");
+        const rtt = nowMs() - t0;
+        console.log(`   • ${httpURL.host} HTTP  → ${rtt} ms`);
+        if (!best || rtt < best.rtt) best = { url: httpURL.toString(), rtt, ok: true, label: s.label, proto: "http:" };
+      } catch {
+        console.log(`   • ${new URL(s.base).host} HTTPS → falha`);
+        console.log(`     ↳ ${httpURL.host} HTTP  → falha`);
+      }
+    }
   }
-  if (!samples.length) throw new Error("Nenhum servidor respondeu.");
-  samples.sort((a,b)=>a.rtt-b.rtt);
-  const best = samples[0];
-  console.log(`✅  Servidor escolhido: ${best.host} (${best.proto.toUpperCase()}), RTT ~ ${best.rtt} ms — ${best.label || ""}`);
+
+  if (!best) throw new Error("Nenhum servidor respondeu RTT");
+  console.log(`✅  Servidor escolhido: ${new URL(best.url).host} (${best.proto.toUpperCase()}), RTT ~ ${best.rtt} ms — ${best.label}`);
   return best;
 }
 
-// ===== Ping/Jitter/Perda =====
-async function pingStatsVerbose(baseUrl, count = DEFAULTS.pingCount, timeoutMs = 2500) {
-  console.log(`🏓  Ping/Jitter/Perda: ${count} amostras…`);
-  let ok = 0, fails = 0;
-  const list = [];
-  for (let i = 0; i < count; i++) {
-    const rtt = await timeGet(`${baseUrl}/?r=${Math.random()}`, timeoutMs);
-    if (rtt === null) { fails++; console.log(`   [${i+1}/${count}] falha`); }
-    else { list.push(rtt); ok++; console.log(`   [${i+1}/${count}] ${rtt} ms`); }
+async function measurePing(baseURL) {
+  console.log("🏓  3) Medindo latência/jitter/perda …");
+  const times = [];
+  let lost = 0;
+  for (let i = 1; i <= PING_SAMPLES; i++) {
+    const u = baseURL + "/?r=" + Math.random();
+    const t0 = nowMs();
+    try {
+      await head(u, 1500, "ping");
+      times.push(nowMs() - t0);
+    } catch {
+      lost++;
+    }
+    process.stdout.write(`   [${i}/${PING_SAMPLES}] ${times[times.length - 1] ?? "timeout"} ms\r`);
     await sleep(30);
   }
-  const lossPct = (fails / (ok + fails)) * 100;
-  const avg = list.length ? list.reduce((a,b)=>a+b,0)/list.length : 0;
-  let jitter = 0;
-  if (list.length > 1) {
-    let sum = 0;
-    for (let i = 1; i < list.length; i++) sum += Math.abs(list[i]-list[i-1]);
-    jitter = sum/(list.length-1);
-  }
-  console.log(`   → ping médio: ${fmtMs(avg)} ms | jitter: ${fmtMs(jitter)} ms | perda: ${lossPct.toFixed(2)} %`);
-  return { avg, jitter, lossPct, samples: list };
+  process.stdout.write("\n");
+  const avg = times.length ? times.reduce((a, b) => a + b, 0) / times.length : Infinity;
+  const jit = times.length > 1
+    ? times.slice(1).reduce((a, t, i) => a + Math.abs(t - times[i]), 0) / (times.length - 1)
+    : 0;
+  const lossPct = (lost / PING_SAMPLES) * 100;
+  console.log(`   → ping médio: ${Math.round(avg)} ms | jitter: ${Math.round(jit)} ms | perda: ${lossPct.toFixed(2)} %`);
+  return { ping: avg, jitter: jit, lossPct };
 }
 
-// ===== Download/Upload com progresso =====
-async function downloadTestVerbose(baseUrl, durationSec, streams, perReqTimeoutMs) {
-  console.log(`⬇️  Download: ${streams} fluxos, ${durationSec}s, pequenos pacotes…`);
+async function measureDownload(baseURL) {
+  console.log("⬇️  4) Medindo DOWNLOAD …");
+  console.log(`⬇️  Download: ${DOWNLOAD_STREAMS} fluxos, ${DOWNLOAD_DURATION_SEC}s, caminho /download/${CHUNK_SIZE_MB} …`);
+
+  const endAt = nowMs() + DOWNLOAD_DURATION_SEC * 1000;
   let totalBytes = 0;
-  const endAt = Date.now() + durationSec*1000;
 
   async function worker(id) {
-    while (Date.now() < endAt) {
+    while (nowMs() < endAt) {
+      const url = `${baseURL}/download/${CHUNK_SIZE_MB}?r=${Math.random()}`;
+      const t0 = nowMs();
       try {
-        const res = await fetchWithTimeout(`${baseUrl}/download?r=${Math.random()}`, { timeoutMs: perReqTimeoutMs });
-        if (!res.ok) continue;
-        const buf = await res.arrayBuffer();
-        totalBytes += buf.byteLength;
-      } catch {}
+        const buf = await fetchBuffer(url, {}, SINGLE_REQ_TIMEOUT_MS, `download-${id}`);
+        const bt = Buffer.from(buf).length; // bytes
+        totalBytes += bt;
+        const sec = (nowMs() - t0) / 1000;
+        process.stdout.write(`   [#${id}] +${(bt / (1024 * 1024)).toFixed(2)} MB em ${sec.toFixed(2)}s\r`);
+      } catch {
+        // ignora erro e tenta de novo
+      }
     }
   }
 
-  const tick = setInterval(() => {
-    const elapsed = Math.max(1, (DEFAULTS.downDuration*1000 - Math.max(0, endAt-Date.now()))/1000);
-    const mbps = (totalBytes*8)/(elapsed*1e6);
-    process.stdout.write(`   [t=${Math.floor(elapsed)}s] ${fmtMB(totalBytes)} MB | ~${fmtMbps(mbps)} Mbps      \r`);
-  }, 1000);
+  const workers = [];
+  for (let i = 1; i <= DOWNLOAD_STREAMS; i++) workers.push(worker(i));
+  await Promise.all(workers);
 
-  await Promise.all(Array.from({length: streams}, (_,i)=>worker(i+1)));
-  clearInterval(tick);
-
-  const elapsed = durationSec;
-  const mbps = (totalBytes*8)/(elapsed*1e6);
+  const elapsedSec = DOWNLOAD_DURATION_SEC;
+  const speed = mbps(totalBytes, elapsedSec);
   process.stdout.write("\n");
-  console.log(`   → total: ${fmtMB(totalBytes)} MB em ${elapsed}s | média: ${fmtMbps(mbps)} Mbps`);
-  return { totalBytes, elapsedSec: elapsed, mbps };
+  console.log(`   → total: ${(totalBytes / (1024 * 1024)).toFixed(2)} MB em ${elapsedSec}s | média: ${speed.toFixed(2)} Mbps`);
+  return speed;
 }
 
-async function uploadTestVerbose(baseUrl, durationSec, streams, chunkKB, perReqTimeoutMs) {
-  console.log(`⬆️  Upload: ${streams} fluxos, ${durationSec}s, blocos de ${chunkKB} KB…`);
+async function measureUpload(baseURL) {
+  console.log("⬆️  5) Medindo UPLOAD …");
+  console.log(`⬆️  Upload: ${UPLOAD_STREAMS} fluxos, ${UPLOAD_DURATION_SEC}s, posts pequenos repetidos…`);
+
+  const endAt = nowMs() + UPLOAD_DURATION_SEC * 1000;
   let totalBytes = 0;
-  const endAt = Date.now() + durationSec*1000;
-  const body = Buffer.alloc(chunkKB*1024, 0x78);
 
-  async function worker(id) {
-    while (Date.now() < endAt) {
-      try {
-        const res = await fetchWithTimeout(`${baseUrl}/upload?r=${Math.random()}`, {
-          timeoutMs: perReqTimeoutMs,
-          method: "POST",
-          headers: { "Content-Type": "application/octet-stream", "Content-Encoding": "identity" },
-          body
-        });
-        if (!res.ok) continue;
-        totalBytes += body.length;
-      } catch {}
-    }
-  }
-
-  const tick = setInterval(() => {
-    const elapsed = Math.max(1, (DEFAULTS.upDuration*1000 - Math.max(0, endAt-Date.now()))/1000);
-    const mbps = (totalBytes*8)/(elapsed*1e6);
-    process.stdout.write(`   [t=${Math.floor(elapsed)}s] ${fmtMB(totalBytes)} MB | ~${fmtMbps(mbps)} Mbps      \r`);
-  }, 1000);
-
-  await Promise.all(Array.from({length: streams}, (_,i)=>worker(i+1)));
-  clearInterval(tick);
-
-  const elapsed = durationSec;
-  const mbps = (totalBytes*8)/(elapsed*1e6);
-  process.stdout.write("\n");
-  console.log(`   → total: ${fmtMB(totalBytes)} MB em ${elapsed}s | média: ${fmtMbps(mbps)} Mbps`);
-  return { totalBytes, elapsedSec: elapsed, mbps };
-}
-
-// ===== Main =====
-(async () => {
-  const cfg = {
-    pingCount: DEFAULTS.pingCount,
-    downDuration: args.downDuration || DEFAULTS.downDuration,
-    upDuration: args.upDuration || DEFAULTS.upDuration,
-    streamsDown: args.streamsDown || DEFAULTS.streamsDown,
-    streamsUp: args.streamsUp || DEFAULTS.streamsUp,
-    uploadChunkKB: DEFAULTS.uploadChunkKB,
-    perReqTimeoutMs: DEFAULTS.perReqTimeoutMs
+  // “Pacote pequeno” em linha com a ideia do uploadDataSmall do site.
+  const CHUNK_BYTES = 256 * 1024; // 256 KB
+  const payload = Buffer.alloc(CHUNK_BYTES, 0x61); // 'a'
+  // application/x-www-form-urlencoded — envia num campo "d="
+  const formPrefix = "d=";
+  const formBuf = Buffer.concat([Buffer.from(formPrefix), payload]);
+  const headers = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Content-Encoding": "identity",
   };
 
-  const cancelDeadline = deadlineAfter(DEFAULTS.globalTimeoutMs);
+  async function worker(id) {
+    while (nowMs() < endAt) {
+      const url = `${baseURL}/upload?r=${Math.random()}`;
+      const t0 = nowMs();
+      try {
+        await withTimeout(
+          (signal) =>
+            fetch(url, {
+              method: "POST",
+              headers,
+              body: formBuf,
+              signal,
+            }),
+          SINGLE_REQ_TIMEOUT_MS,
+          `upload-${id}`
+        );
+        totalBytes += CHUNK_BYTES;
+        const sec = (nowMs() - t0) / 1000;
+        process.stdout.write(`   [#${id}] +${(CHUNK_BYTES / 1024).toFixed(0)} KB em ${sec.toFixed(2)}s\r`);
+      } catch {
+        // ignora e continua
+      }
+    }
+  }
+
+  const workers = [];
+  for (let i = 1; i <= UPLOAD_STREAMS; i++) workers.push(worker(i));
+  await Promise.all(workers);
+
+  const elapsedSec = UPLOAD_DURATION_SEC;
+  const speed = mbps(totalBytes, elapsedSec);
+  process.stdout.write("\n");
+  console.log(`   → total: ${(totalBytes / (1024 * 1024)).toFixed(2)} MB em ${elapsedSec}s | média: ${speed.toFixed(2)} Mbps`);
+  return speed;
+}
+
+async function main() {
+  const globalCtrl = new AbortController();
+  const globalTimer = setTimeout(() => {
+    console.error("⏱️  Timeout global de 3 minutos atingido. Encerrando…");
+    process.exit(1);
+  }, GLOBAL_TIMEOUT_MS);
 
   try {
-    console.log("🌐  1) Descobrindo servidores (STINFO:get-resume) …");
-    const resume = await getResume();
-    const entries = extractHostsFromResume(resume);
-    if (!entries.length) throw new Error("get-resume não retornou servidores.");
+    const { onnet, offnet, ispOrg, ip, reg } = await discoverServers();
+    const all = [...onnet, ...offnet];
 
-    console.log(`   ISP: ${resume?.isp?.as?.org?.name || "?"} | IP: ${resume?.isp?.ip?.number || "?"} | Região: ${resume?.geo?.address || "?"}`);
-    console.log(`   Servidores retornados: on/off = ${resume?.ptts?.onnet?.length || 0}/${resume?.ptts?.offnet?.length || 0}`);
+    const best = await chooseBestServer(all);
 
-    let baseUrl, best;
-    if (args.host) {
-      const proto = args.forceProto || "https";
-      baseUrl = `${proto}://${args.host}`;
-      console.log(`🧭  2) Servidor forçado por CLI: ${baseUrl}`);
-    } else {
-      console.log("🧭  2) Selecionando melhor servidor por RTT …");
-      best = await selectBestServerDynamic(entries, args.forceProto);
-      baseUrl = `${best.proto}://${best.host}`;
-    }
+    const pingStats = await measurePing(best.url);
 
-    console.log("🏓  3) Medindo latência/jitter/perda …");
-    const ping = await pingStatsVerbose(baseUrl, cfg.pingCount, 2500);
-
-    console.log("⬇️  4) Medindo DOWNLOAD …");
-    const down = await downloadTestVerbose(baseUrl, cfg.downDuration, cfg.streamsDown, cfg.perReqTimeoutMs);
-
-    console.log("⬆️  5) Medindo UPLOAD …");
-    const up = await uploadTestVerbose(baseUrl, cfg.upDuration, cfg.streamsUp, cfg.uploadChunkKB, cfg.perReqTimeoutMs);
-
-    const result = {
-      timestamp: nowISO(),
-      isp: {
-        ip: resume?.isp?.ip?.number || null,
-        asn: resume?.isp?.as?.asn || null,
-        org: resume?.isp?.as?.org?.name || null
-      },
-      geo: {
-        address: resume?.geo?.address || null,
-        city: resume?.geo?.city || null,
-        state: resume?.geo?.stateIsoA2 || null
-      },
-      server: best ? { host: best.host, label: best.label || null, protocol: best.proto, rtt_ms: best.rtt } : { host: args.host, protocol: args.forceProto || "https" },
-      latency_ms: fmtMs(ping.avg),
-      jitter_ms: fmtMs(ping.jitter),
-      packet_loss_pct: Number(ping.lossPct.toFixed(2)),
-      download_mbps: Number(fmtMbps(down.mbps)),
-      upload_mbps: Number(fmtMbps(up.mbps))
-    };
+    const dl = await measureDownload(best.url);
+    const ul = await measureUpload(best.url);
 
     console.log("\n✅  RESUMO");
-    console.log(`   Servidor: ${result.server.host} (${result.server.protocol.toUpperCase()})`);
-    console.log(`   Ping médio: ${result.latency_ms} ms | Jitter: ${result.jitter_ms} ms | Perda: ${result.packet_loss_pct}%`);
-    console.log(`   Download: ${result.download_mbps} Mbps | Upload: ${result.upload_mbps} Mbps\n`);
+    console.log(`   Servidor: ${new URL(best.url).host} (${new URL(best.url).protocol.replace(":", "").toUpperCase()}) — ${best.label}`);
+    console.log(`   Ping médio: ${Math.round(pingStats.ping)} ms | Jitter: ${Math.round(pingStats.jitter)} ms | Perda: ${pingStats.lossPct.toFixed(0)}%`);
+    console.log(`   Download: ${dl.toFixed(2)} Mbps | Upload: ${ul.toFixed(2)} Mbps\n`);
 
-    // JSON final (caso você queira parsear em outra ferramenta)
-    console.log(JSON.stringify(result, null, 2));
-  } catch (err) {
-    console.error("❌  Falha:", err.message);
-    process.exit(1);
+    // JSON final
+    const out = {
+      timestamp: new Date().toISOString(),
+      isp: { ip, org: ispOrg },
+      geo: { address: reg },
+      server: { host: new URL(best.url).host, protocol: new URL(best.url).protocol.replace(":", ""), label: best.label, rtt_ms: best.rtt },
+      latency_ms: Math.round(pingStats.ping),
+      jitter_ms: Math.round(pingStats.jitter),
+      packet_loss_pct: +pingStats.lossPct.toFixed(2),
+      download_mbps: +dl.toFixed(2),
+      upload_mbps: +ul.toFixed(2),
+    };
+    console.log(JSON.stringify(out, null, 2));
   } finally {
-    cancelDeadline();
+    clearTimeout(globalTimer);
+    globalCtrl.abort();
   }
-})();
+}
+
+main().catch((e) => {
+  console.error("ERRO:", e.message || e);
+  process.exit(1);
+});
