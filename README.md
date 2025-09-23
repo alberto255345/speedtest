@@ -52,8 +52,11 @@ speedtest --accept-license --accept-gdpr -f json | jq .
 
 ```
 mkdir -p ~/speedtest && cd ~/speedtest
-# copie monitor.py, test.js, mac.txt, requirements.txt e install_speedtest_service.sh
+# copie monitor.py, test.js, mac.txt, requirements.txt, package.json, package-lock.json e install_speedtest_service.sh para o Raspberry Pi (ou diretório de destino)
+npm install
 ```
+
+> 💡 O `npm install` garante a instalação do `node-fetch` (via `package.json`), necessário para o `test.js`.
 
 ### 4. Configurar ambiente Python
 
@@ -111,6 +114,7 @@ python3 monitor.py --once
 
 * Troca o MAC → testa ping → roda Speedtest (Ookla + JS) → envia e-mail → reseta modem (se relé ativo)
 * **Sai** após o ciclo. Útil para testes.
+* Antes de rodar este ciclo (ou executar o `test.js` manualmente), garanta que já foi executado `npm install` para instalar as dependências Node.
 
 ---
 
