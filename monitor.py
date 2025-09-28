@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 MAC_FILE = HERE / "mac.txt"
 MAC_INDEX_FILE = HERE / "mac_index.txt"
 OOKLA_JSON = HERE / "ookla_result.json"
+LOG_FILE = HERE / "connection_log.csv"
 
 # Carrega .env logo no início
 load_dotenv()
@@ -62,6 +63,16 @@ def has_cmd(name: str) -> bool:
 def ping_ok():
     rc, _, _ = sh(["ping", "-c", "3", "-W", "2", "8.8.8.8"])
     return rc == 0
+
+def get_ip_address(iface: str):
+    rc, out, _ = sh(["ip", "-4", "addr", "show", "dev", iface])
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("inet "):
+            return line.split()[1].split("/")[0]
+    return None
 
 def wait_connectivity(timeout_sec=90) -> bool:
     """Espera a internet voltar (ping OK) até timeout."""
@@ -145,6 +156,19 @@ def get_next_mac():
     MAC_INDEX_FILE.write_text(str((idx + 1) % len(macs)))
     return mac
 
+# ================== LOG ==================
+def ensure_log_file():
+    if not LOG_FILE.exists():
+        LOG_FILE.write_text("timestamp;mac;ip;resultado\n", encoding="utf-8")
+
+def append_log_entry(timestamp: str, mac: str, ip: str, result: str):
+    ensure_log_file()
+    safe_result = result.replace("\n", " ").replace("\r", " ")
+    safe_result = safe_result.replace(";", ",")
+    line = f"{timestamp};{mac};{ip};{safe_result}\n"
+    with LOG_FILE.open("a", encoding="utf-8") as fp:
+        fp.write(line)
+
 # ================== TESTES ==================
 def run_ookla_speedtest():
     cmd = ["speedtest", "--accept-license", "--accept-gdpr", "-f", "json"]
@@ -166,6 +190,77 @@ def run_js_speedtest(js_path: Path, result_json_path: Path):
         return json.loads(result_json_path.read_text(encoding="utf-8"))
     except Exception as e:
         return {"error": f"read {result_json_path.name}: {e}"}
+
+def perform_speed_tests(label: str, mac: str, js_path: Path, result_json_path: Path):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    mac_display = mac or "N/D"
+    ip = get_ip_address(NET_IFACE)
+    ip_display = ip or "N/D"
+
+    print(f"🔍 [{label}] Ping 8.8.8.8 ...")
+    ping_success = ping_ok()
+    log_parts = [label, f"Ping {'OK' if ping_success else 'falhou'}"]
+
+    body_lines = [
+        f"📋 {label}",
+        f"🕒 Momento: {timestamp}",
+        f"📡 Interface: {NET_IFACE}",
+        f"🆔 MAC: {mac_display}",
+        f"🌐 IP: {ip_display}",
+    ]
+
+    if ping_success:
+        print("✅ Ping OK")
+        print(f"🚀 [{label}] Ookla speedtest (CLI) ...")
+        ookla = run_ookla_speedtest()
+        body_lines.append("")
+        body_lines.append("⚡ Ookla CLI:")
+        body_lines.append(summarize_ookla(ookla))
+        if isinstance(ookla, dict) and "error" not in ookla:
+            dl_bw = ookla.get("download", {}).get("bandwidth")
+            ul_bw = ookla.get("upload", {}).get("bandwidth")
+            dl_mbps = (dl_bw or 0) / 1e6
+            ul_mbps = (ul_bw or 0) / 1e6
+            log_parts.append(f"Ookla DL {dl_mbps:.2f} UL {ul_mbps:.2f}")
+        else:
+            log_parts.append("Ookla erro")
+
+        print(f"📊 [{label}] Script JS de velocidade ...")
+        js_data = run_js_speedtest(js_path, result_json_path)
+        body_lines.append("")
+        body_lines.append("📈 Speedtest JS (resumo bruto JSON):")
+        body_lines.append(json.dumps(js_data, indent=2, ensure_ascii=False)[:6000])
+
+        if isinstance(js_data, dict) and "error" not in js_data:
+            dl_js = js_data.get("download_mbps")
+            ul_js = js_data.get("upload_mbps")
+            if isinstance(dl_js, (int, float)) and isinstance(ul_js, (int, float)):
+                log_parts.append(f"JS DL {dl_js:.2f} UL {ul_js:.2f}")
+            else:
+                log_parts.append("JS dados incompletos")
+        else:
+            log_parts.append("JS erro")
+    else:
+        print("❌ Sem conectividade (ping falhou).")
+        body_lines.append("")
+        body_lines.append("❌ Sem conectividade (ping falhou).")
+        ookla = {}
+        js_data = {}
+
+    log_result = " | ".join(log_parts)
+    append_log_entry(timestamp, mac_display, ip_display, log_result)
+
+    return {
+        "label": label,
+        "timestamp": timestamp,
+        "mac": mac_display,
+        "ip": ip_display,
+        "ping_ok": ping_success,
+        "ookla": ookla,
+        "js_data": js_data,
+        "body_text": "\n".join(body_lines),
+        "log_result": log_result,
+    }
 
 # ================== EMAIL ==================
 def send_email(subject, body, attachments=None):
@@ -211,12 +306,15 @@ def send_email(subject, body, attachments=None):
 def reset_modem(relay_pin: int, pulse_seconds: float = 2.0, active_high: bool = True):
     if not GPIO:
         print("⚠️  Ignorando reset_modem: GPIO não carregado.")
-        return
+        return False
     level_on  = GPIO.HIGH if active_high else GPIO.LOW
     level_off = GPIO.LOW if active_high else GPIO.HIGH
+    print(f"🔌 Relé acionado por {pulse_seconds}s ...")
     GPIO.output(relay_pin, level_on)
     time.sleep(pulse_seconds)
     GPIO.output(relay_pin, level_off)
+    print("🔌 Relé desacionado.")
+    return True
 
 # ================== UTIL ==================
 def summarize_ookla(d):
@@ -236,6 +334,7 @@ def main():
     ap.add_argument("--once", action="store_true", help="Executa 1 ciclo e sai")
     ap.add_argument("--no-relay", dest="no_relay", action="store_true", help="Não aciona o relé")
     ap.add_argument("--relay-pin", type=int, default=RELAY_PIN_DEFAULT, help="GPIO BCM do relé (padrão: 17)")
+    ap.add_argument("--relay-delay-seconds", type=int, default=30, help="Tempo (s) com o relé acionado antes de liberar")
     ap.add_argument("--cooldown-seconds", type=int, default=3*60*60, help="Intervalo entre ciclos (padrão: 10800s)")
     ap.add_argument("--js", default=str(HERE / "test.js"), help="Caminho do script JS")
     ap.add_argument("--json", default=str(HERE / "result.json"), help="Caminho do result.json do JS")
@@ -244,6 +343,9 @@ def main():
     gpio_ready = False
     if not args.no_relay:
         gpio_ready = maybe_setup_gpio(args.relay_pin)
+
+    js_path = Path(args.js)
+    result_json_path = Path(args.json)
 
     while True:
         # 1) Rotação de MAC
@@ -254,48 +356,52 @@ def main():
         else:
             print("⚠️  mac.txt ausente ou vazio — sem rotação de MAC.")
 
-        # 2) Testes (só seguem se ping OK)
-        print("🔍 Ping 8.8.8.8 ...")
-        if ping_ok():
-            print("✅ Ping OK")
-            print("🚀 Ookla speedtest (CLI) ...")
-            ookla = run_ookla_speedtest()
-
-            print("📊 Script JS de velocidade ...")
-            js_data = run_js_speedtest(Path(args.js), Path(args.json))
-
-            body = []
-            body.append(f"📡 Interface: {NET_IFACE} | MAC: {mac or 'N/D'}")
-            body.append("✅ Ping: OK")
-            body.append("\n⚡ Ookla CLI:\n" + summarize_ookla(ookla))
-            body.append("\n📈 Speedtest JS (resumo bruto JSON):")
-            body.append(json.dumps(js_data, indent=2, ensure_ascii=False)[:6000])
-
-            attachments = []
-            if OOKLA_JSON.exists(): attachments.append(OOKLA_JSON)
-            rjson = Path(args.json)
-            if rjson.exists(): attachments.append(rjson)
-            rcsv = HERE / "results.csv"
-            if rcsv.exists(): attachments.append(rcsv)
-
-            try:
-                send_email("Relatório de Teste de Conexão (Raspberry)", "\n".join(body), attachments)
-                print("✉️  Email enviado.")
-            except Exception as e:
-                print(f"❌ Falha enviando email: {e}")
-        else:
-            print("❌ Sem conectividade (ping falhou).")
+        # 2) Testes
+        reports = []
+        reports.append(perform_speed_tests("Teste inicial", mac, js_path, result_json_path))
 
         # 3) Reset modem
         if gpio_ready and not args.no_relay:
             print("🔄 Resetando modem via relé ...")
             try:
-                reset_modem(args.relay_pin, pulse_seconds=2.0, active_high=True)
-                print("✅ Reset efetuado.")
+                acionou = reset_modem(args.relay_pin, pulse_seconds=float(max(args.relay_delay_seconds, 0)), active_high=True)
+                if acionou:
+                    print("✅ Ciclo do relé concluído.")
+                else:
+                    print("⚠️  Relé não pôde ser acionado.")
             except Exception as e:
                 print(f"⚠️  Falha no reset via GPIO: {e}")
+            wait_time = max(args.relay_delay_seconds, 90)
+            print(f"⏱️  Aguardando retorno da conectividade (timeout {wait_time}s) ...")
+            if wait_connectivity(wait_time):
+                print("✅ Conectividade restabelecida após reset.")
+            else:
+                print("⚠️  Conectividade não voltou no tempo esperado após reset.")
+
+            reports.append(perform_speed_tests("Teste pós-reset", mac, js_path, result_json_path))
 
         # 4) Intervalo
+        attachments = []
+        if OOKLA_JSON.exists(): attachments.append(OOKLA_JSON)
+        if result_json_path.exists(): attachments.append(result_json_path)
+        rcsv = HERE / "results.csv"
+        if rcsv.exists(): attachments.append(rcsv)
+        if LOG_FILE.exists(): attachments.append(LOG_FILE)
+
+        body_sections = []
+        for report in reports:
+            body_sections.append(report["body_text"])
+            body_sections.append("")
+        body_sections.append("🗒️ Entradas adicionadas ao arquivo connection_log.csv:")
+        for report in reports:
+            body_sections.append(f"- {report['timestamp']} | {report['log_result']}")
+
+        try:
+            send_email("Relatório de Teste de Conexão (Raspberry)", "\n".join(body_sections).strip(), attachments)
+            print("✉️  Email enviado.")
+        except Exception as e:
+            print(f"❌ Falha enviando email: {e}")
+
         if args.once:
             break
         secs = args.cooldown_seconds
