@@ -334,11 +334,34 @@ def main():
     ap.add_argument("--once", action="store_true", help="Executa 1 ciclo e sai")
     ap.add_argument("--no-relay", dest="no_relay", action="store_true", help="Não aciona o relé")
     ap.add_argument("--relay-pin", type=int, default=RELAY_PIN_DEFAULT, help="GPIO BCM do relé (padrão: 17)")
-    ap.add_argument("--relay-delay-seconds", type=int, default=30, help="Tempo (s) com o relé acionado antes de liberar")
+    ap.add_argument("--relay-pulse-seconds", type=float, default=None, help="Duração do pulso do relé (s) – ativa o reset")
+    ap.add_argument("--relay-delay-seconds", dest="relay_delay_seconds", type=float, default=None, help="DEPRECIADO: use --relay-pulse-seconds")
+    ap.add_argument("--post-reset-wait-seconds", type=int, default=None, help="Timeout (s) para aguardar conectividade após reset")
     ap.add_argument("--cooldown-seconds", type=int, default=3*60*60, help="Intervalo entre ciclos (padrão: 10800s)")
     ap.add_argument("--js", default=str(HERE / "test.js"), help="Caminho do script JS")
     ap.add_argument("--json", default=str(HERE / "result.json"), help="Caminho do result.json do JS")
     args = ap.parse_args()
+
+    # Compatibilidade e defaults: nome novo e comportamento desacoplado
+    relay_pulse_seconds = args.relay_pulse_seconds
+    if relay_pulse_seconds is None:
+        if getattr(args, "relay_delay_seconds", None) is not None:
+            relay_pulse_seconds = float(args.relay_delay_seconds)
+            print("⚠️  --relay-delay-seconds está DEPRECIADO; use --relay-pulse-seconds.")
+        else:
+            relay_pulse_seconds = 30.0
+    try:
+        relay_pulse_seconds = float(relay_pulse_seconds)
+    except Exception:
+        relay_pulse_seconds = 30.0
+
+    post_reset_wait_seconds = args.post_reset_wait_seconds
+    if post_reset_wait_seconds is None:
+        post_reset_wait_seconds = 90
+    try:
+        post_reset_wait_seconds = max(0, int(post_reset_wait_seconds))
+    except Exception:
+        post_reset_wait_seconds = 90
 
     gpio_ready = False
     if not args.no_relay:
@@ -361,17 +384,25 @@ def main():
         reports.append(perform_speed_tests("Teste inicial", mac, js_path, result_json_path))
 
         # 3) Reset modem
+        acionou = False
         if gpio_ready and not args.no_relay:
-            print("🔄 Resetando modem via relé ...")
-            try:
-                acionou = reset_modem(args.relay_pin, pulse_seconds=float(max(args.relay_delay_seconds, 0)), active_high=True)
-                if acionou:
-                    print("✅ Ciclo do relé concluído.")
-                else:
-                    print("⚠️  Relé não pôde ser acionado.")
-            except Exception as e:
-                print(f"⚠️  Falha no reset via GPIO: {e}")
-            wait_time = max(args.relay_delay_seconds, 90)
+            if relay_pulse_seconds <= 0:
+                print("ℹ️  Pulso do relé <= 0s — reset ignorado.")
+            else:
+                print("🔄 Resetando modem via relé ...")
+                try:
+                    acionou = reset_modem(args.relay_pin, pulse_seconds=float(relay_pulse_seconds), active_high=True)
+                    if acionou:
+                        print("✅ Ciclo do relé concluído.")
+                    else:
+                        print("⚠️  Relé não pôde ser acionado.")
+                except Exception as e:
+                    print(f"⚠️  Falha no reset via GPIO: {e}")
+        else:
+            print("ℹ️  Reset via relé desativado ou GPIO indisponível.")
+
+        if acionou:
+            wait_time = post_reset_wait_seconds
             print(f"⏱️  Aguardando retorno da conectividade (timeout {wait_time}s) ...")
             if wait_connectivity(wait_time):
                 print("✅ Conectividade restabelecida após reset.")
