@@ -8,6 +8,7 @@ import smtplib
 import argparse
 import shutil
 import subprocess
+import RPi.GPIO as GPIO #Importacao da biblioteca na "head" do código
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -339,15 +340,26 @@ def main():
     ap.add_argument("--js", default=str(HERE / "test.js"), help="Caminho do script JS")
     ap.add_argument("--json", default=str(HERE / "result.json"), help="Caminho do result.json do JS")
     args = ap.parse_args()
-
+    
     gpio_ready = False
     if not args.no_relay:
         gpio_ready = maybe_setup_gpio(args.relay_pin)
-
+#----------------> @@@Alterado 28/09
+#"Reset" GPIO - limpa e monta - Solucao para disparo do rele no "start"
+    GPIO.cleanup()
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(17, GPIO.OUT)
+#<---------------------------------##
     js_path = Path(args.js)
     result_json_path = Path(args.json)
 
     while True:
+#----------------> @@@Alterado 28/09
+#"Limpa" GPIO - Desliga o rele (Reativa ONT)
+        GPIO.cleanup()
+#Espera xx tempo reinicializacao ONT
+        time.sleep(180)
+#<---------------------------------##
         # 1) Rotação de MAC
         mac = get_next_mac()
         if mac:
@@ -361,6 +373,11 @@ def main():
         reports.append(perform_speed_tests("Teste inicial", mac, js_path, result_json_path))
 
         # 3) Reset modem
+##----------------> @@@Alterado 28/09
+##------"Monta" antes de chamar a funcao reset_modem
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(17, GPIO.OUT)
+#------------------------------------------------##
         if gpio_ready and not args.no_relay:
             print("🔄 Resetando modem via relé ...")
             try:
