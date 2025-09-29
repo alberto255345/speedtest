@@ -8,13 +8,15 @@ import smtplib
 import argparse
 import shutil
 import subprocess
-import RPi.GPIO as GPIO #Importacao da biblioteca na "head" do código
+import RPi.GPIO as GPIO  # Importacao da biblioteca na "head" do código
+import ipaddress
 from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email import encoders
 from dotenv import load_dotenv
+from urllib.request import urlopen
 
 # ================== CONFIG & GPIO ==================
 HERE = Path(__file__).resolve().parent
@@ -22,11 +24,24 @@ MAC_FILE = HERE / "mac.txt"
 MAC_INDEX_FILE = HERE / "mac_index.txt"
 OOKLA_JSON = HERE / "ookla_result.json"
 LOG_FILE = HERE / "connection_log.csv"
+PID_FILE = HERE / "program.pid"
 
 # Carrega .env logo no início
 load_dotenv()
 NET_IFACE = os.getenv("NET_IFACE", "eth0")  # defina eth0 ou wlan0 no .env
 RELAY_PIN_DEFAULT = int(os.getenv("RELAY_PIN", "17"))
+
+# ADDED: seleção de UF e prefixo base (4 octetos)
+UF_ENV = (os.getenv("UF") or "").strip().upper()
+MAC_BASE_PREFIX = os.getenv("MAC_BASE_PREFIX", "02:AB:CD:EF").strip().upper()
+
+# ADDED: mapeamento único (penúltimo byte) para as 27 UFs
+UF_HEX_MAP = {
+    "AC": 0x01, "AL": 0x02, "AP": 0x03, "AM": 0x04, "BA": 0x05, "CE": 0x06, "DF": 0x07,
+    "ES": 0x08, "GO": 0x09, "MA": 0x0A, "MT": 0x0B, "MS": 0x0C, "MG": 0x0D, "PA": 0x0E,
+    "PB": 0x0F, "PR": 0x10, "PE": 0x11, "PI": 0x12, "RJ": 0x13, "RN": 0x14, "RS": 0x15,
+    "RO": 0x16, "RR": 0x17, "SC": 0x18, "SP": 0x19, "SE": 0x1A, "TO": 0x1B,
+}
 
 GPIO = None
 def _gpio_cleanup():
@@ -73,6 +88,31 @@ def get_ip_address(iface: str):
         line = line.strip()
         if line.startswith("inet "):
             return line.split()[1].split("/")[0]
+    return None
+
+# ADDED: obter IP público
+def get_public_ip(timeout=4):
+    """Descobre o IP público consultando endpoints externos."""
+    # 1) Tenta via curl (se existir)
+    for url in ["https://api.ipify.org", "https://ifconfig.me", "https://icanhazip.com"]:
+        if has_cmd("curl"):
+            rc, out, _ = sh(["curl", "-fsS", "--max-time", str(timeout), url])
+            if rc == 0:
+                ip = out.strip()
+                try:
+                    ipaddress.ip_address(ip)
+                    return ip
+                except Exception:
+                    pass
+    # 2) Fallback: urllib (sem depender de curl)
+    for url in ["https://api.ipify.org", "https://ifconfig.me", "https://icanhazip.com"]:
+        try:
+            with urlopen(url, timeout=timeout) as r:
+                ip = r.read().decode().strip()
+                ipaddress.ip_address(ip)
+                return ip
+        except Exception:
+            continue
     return None
 
 def wait_connectivity(timeout_sec=90) -> bool:
@@ -140,11 +180,51 @@ def apply_mac_rotation(iface: str, mac: str) -> bool:
     return False
 
 # ================== MAC LISTA ==================
+# ADDED: gera lista de 10 MACs para a UF (penúltimo byte fixo por UF, último 01..10)
+def gen_mac_list_for_uf(uf: str):
+    uf = (uf or "").upper()
+    if uf not in UF_HEX_MAP:
+        return None
+    try:
+        # valida prefixo "AA:BB:CC:DD"
+        parts = MAC_BASE_PREFIX.split(":")
+        if len(parts) != 4 or not all(len(p) == 2 for p in parts):
+            print(f"⚠️ Prefixo MAC_BASE_PREFIX inválido: {MAC_BASE_PREFIX}. Usando padrão 02:AB:CD:EF.")
+            base = "02:AB:CD:EF"
+        else:
+            base = MAC_BASE_PREFIX
+    except Exception:
+        base = "02:AB:CD:EF"
+
+    xx = UF_HEX_MAP[uf]
+    macs = [f"{base}:{xx:02X}:{i:02X}" for i in range(1, 11)]  # :01 .. :10
+    return macs
+
+# CHANGED: agora suporta UF; se UF definida, usa lista gerada e índice por UF
 def get_next_mac():
-    """Lê próximo MAC de mac.txt em sequência circular."""
+    """Retorna o próximo MAC em sequência circular.
+       - Se UF definida no .env: usa lista gerada por UF (10 MACs), índice por UF.
+       - Caso contrário: lê de mac.txt como antes."""
+    # Caminho de índice pode variar por UF
+    if UF_ENV in UF_HEX_MAP:
+        macs = gen_mac_list_for_uf(UF_ENV)
+        if not macs:
+            return None
+        idx_path = HERE / f"mac_index_{UF_ENV}.txt"  # índice por UF
+        idx = 0
+        if idx_path.exists():
+            try:
+                idx = int(idx_path.read_text().strip() or "0")
+            except ValueError:
+                idx = 0
+        mac = macs[idx % len(macs)]
+        idx_path.write_text(str((idx + 1) % len(macs)))
+        return mac
+
+    # Fallback: comportamento antigo com mac.txt
     if not MAC_FILE.exists():
         return None
-    macs = [l.strip() for l in MAC_FILE.read_text().splitlines() if l.strip()]
+    macs = [l.strip().upper() for l in MAC_FILE.read_text().splitlines() if l.strip()]
     if not macs:
         return None
     idx = 0
@@ -195,8 +275,9 @@ def run_js_speedtest(js_path: Path, result_json_path: Path):
 def perform_speed_tests(label: str, mac: str, js_path: Path, result_json_path: Path):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     mac_display = mac or "N/D"
-    ip = get_ip_address(NET_IFACE)
-    ip_display = ip or "N/D"
+    # CHANGED: usar IP público
+    public_ip = get_public_ip()
+    ip_display = public_ip or "N/D"
 
     print(f"🔍 [{label}] Ping 8.8.8.8 ...")
     ping_success = ping_ok()
@@ -207,7 +288,8 @@ def perform_speed_tests(label: str, mac: str, js_path: Path, result_json_path: P
         f"🕒 Momento: {timestamp}",
         f"📡 Interface: {NET_IFACE}",
         f"🆔 MAC: {mac_display}",
-        f"🌐 IP: {ip_display}",
+        f"🌐 IP público: {ip_display}",
+        f"🇧🇷 UF: {UF_ENV or 'N/D'}",  # ADDED: só informativo
     ]
 
     if ping_success:
@@ -329,6 +411,22 @@ def summarize_ookla(d):
     srv = d.get("server", {}).get("host")
     return f"Servidor: {srv}\nPing: {ping} ms\nDownload (bandwidth): {dl_mbps:.2f} Mbps\nUpload (bandwidth): {ul_mbps:.2f} Mbps"
 
+# ADDED: PID helpers
+def _remove_pidfile():
+    try:
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+    except Exception:
+        pass
+
+def _write_pidfile():
+    try:
+        PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        atexit.register(_remove_pidfile)
+        print(f"🆔 PID salvo em {PID_FILE}")
+    except Exception as e:
+        print(f"⚠️ Não foi possível gravar PID em {PID_FILE}: {e}")
+
 # ================== MAIN ==================
 def main():
     ap = argparse.ArgumentParser(description="Monitor de rede + rotação de MAC + ciclo 3h")
@@ -340,6 +438,8 @@ def main():
     ap.add_argument("--js", default=str(HERE / "test.js"), help="Caminho do script JS")
     ap.add_argument("--json", default=str(HERE / "result.json"), help="Caminho do result.json do JS")
     args = ap.parse_args()
+
+    _write_pidfile()
     
     gpio_ready = False
     if not args.no_relay:
@@ -366,18 +466,15 @@ def main():
             ok = apply_mac_rotation(NET_IFACE, mac)
             print(f"📡 MAC aplicado ({NET_IFACE}): {mac}" if ok else f"⚠️  Falha ao aplicar MAC {mac}")
         else:
-            print("⚠️  mac.txt ausente ou vazio — sem rotação de MAC.")
+            print("⚠️  Lista de MACs indisponível — verifique UF no .env ou mac.txt.")
 
-        # 2) Testes
+        # 2) Testes (APENAS UMA VEZ, após trocar MAC)
         reports = []
-        reports.append(perform_speed_tests("Teste inicial", mac, js_path, result_json_path))
+        reports.append(perform_speed_tests("Teste após MAC", mac, js_path, result_json_path))
 
-        # 3) Reset modem
-##----------------> @@@Alterado 28/09
-##------"Monta" antes de chamar a funcao reset_modem
+        # 3) Reset modem (mantido)
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(17, GPIO.OUT)
-#------------------------------------------------##
         if gpio_ready and not args.no_relay:
             print("🔄 Resetando modem via relé ...")
             try:
@@ -395,7 +492,7 @@ def main():
             else:
                 print("⚠️  Conectividade não voltou no tempo esperado após reset.")
 
-            reports.append(perform_speed_tests("Teste pós-reset", mac, js_path, result_json_path))
+            # (sem novo bloco de testes pós-reset)
 
         # 4) Intervalo
         attachments = []
