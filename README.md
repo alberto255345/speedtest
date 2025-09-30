@@ -1,216 +1,119 @@
-# Monitoramento de Conexão + Speedtest + Rotação de MAC
+# Monitoramento de Conexão (C++)
 
-Este projeto roda em **Raspberry Pi** e executa um ciclo automático de testes de rede:
+Projeto para Raspberry Pi que automatiza testes de conexão, troca de endereço MAC e envio de relatórios por e-mail. A nova versão foi reescrita em **C++17**, mantendo a arquitetura em camadas (Domain, Application, Infrastructure, Utility).
 
-1. Troca o **MAC address** da interface (`eth0` ou `wlan0`).
-2. Testa conectividade (ping `8.8.8.8`).
-3. Executa **Speedtest CLI** (Ookla).
-4. Executa o seu script **JS (`test.js`)** que gera `result.json`/`results.csv`.
-5. Envia um **relatório por e-mail** com anexos (`ookla_result.json`, `result.json`, `results.csv`).
-6. Aciona um **relé** no GPIO (reset modem).
-7. Aguarda 3h e repete.
+## Funcionalidades
 
----
+- Rotação de endereços MAC a partir de `mac.txt`.
+- Verificação de conectividade (`ping` em 8.8.8.8).
+- Testes de velocidade via **Speedtest CLI** (Ookla) e script Node (`test.js`).
+- Envio de e-mail com anexos (`ookla_result.json`, `result.json`, `results.csv`, `connection_log.csv`).
+- Acionamento de relé via GPIO (biblioteca wiringPi) para reset do modem.
 
-## 📂 Estrutura
+## Estrutura do projeto
 
 ```
-/home/pi/speedtest/
-├─ monitor.py # Script principal em Python
-├─ .env # Credenciais e configuração
-├─ mac.txt # Lista de MACs (10 linhas)
-├─ test.js # Script JS que gera result.json
-├─ result.json # Saída do test.js
-├─ results.csv # Saída do test.js
-├─ requirements.txt # Dependências Python
-└─ install_speedtest_service.sh # Script para criar e iniciar o serviço systemd
+.
+├── CMakeLists.txt
+├── Makefile
+├── README.md
+├── mac.txt
+├── package.json / package-lock.json / node_modules (para o script JS)
+├── src/
+│   ├── app/
+│   │   └── MonitorService.{hpp,cpp}
+│   ├── domain/
+│   │   ├── EmailSender.hpp
+│   │   ├── Logger.hpp
+│   │   ├── MacProvider.hpp
+│   │   ├── NetworkAdapter.hpp
+│   │   ├── Relay.hpp
+│   │   ├── Report.hpp
+│   │   └── SpeedTester.hpp
+│   ├── infra/
+│   │   ├── CurlEmailSender.{hpp,cpp}
+│   │   ├── FileCsvLogger.{hpp,cpp}
+│   │   ├── JsSpeedTester.hpp
+│   │   ├── LinuxNetworkAdapter.{hpp,cpp}
+│   │   ├── MacListProvider.{hpp,cpp}
+│   │   ├── OoklaSpeedTester.{hpp,cpp}
+│   │   └── WiringPiRelay.hpp
+│   ├── util/
+│   │   ├── Env.{hpp,cpp}
+│   │   ├── Process.{hpp,cpp}
+│   │   └── Time.{hpp,cpp}
+│   └── main.cpp
+├── test.js
+└── .env.example
 ```
 
----
+## Dependências
 
-## ⚙️ Instalação
+- g++ com suporte a C++17
+- CMake (opcional, mas recomendado)
+- `libcurl` e `libcurl` headers
+- `nlohmann-json3-dev` (ou equivalente via pkg-config `nlohmann_json`)
+- `wiringpi`
+- Node.js (para executar `test.js`)
+- Speedtest CLI (Ookla)
 
-### 1. Atualizar sistema e instalar dependências
+No Raspberry Pi OS:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-pip python3-venv nodejs npm \
-                    curl ca-certificates git \
-                    python3-rpi.gpio
-```
-
-### 2. Instalar Speedtest CLI (Ookla oficial)
-
-```
+sudo apt install -y g++ cmake pkg-config libcurl4-openssl-dev nlohmann-json3-dev wiringpi \
+    nodejs npm
 curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | sudo bash
 sudo apt install -y speedtest
-# Teste:
-speedtest --accept-license --accept-gdpr -f json | jq .
 ```
 
-### 3. Clonar/copiar projeto
+Instale também as dependências do script JavaScript:
 
-```
-mkdir -p ~/speedtest && cd ~/speedtest
-# copie monitor.py, test.js, mac.txt, requirements.txt, package.json, package-lock.json e install_speedtest_service.sh para o Raspberry Pi (ou diretório de destino)
+```bash
 npm install
 ```
 
-> 💡 O `npm install` garante a instalação do `node-fetch` (via `package.json`), necessário para o `test.js`.
+## Configuração
 
-### 4. Configurar ambiente Python
+1. Copie `.env.example` para `.env` e ajuste variáveis como `NET_IFACE`, `EMAIL_USER`, `EMAIL_PASS`, `EMAIL_TO`, etc.
+2. Edite `mac.txt` com a lista de endereços MAC a serem rotacionados (um por linha).
 
-```
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+## Compilação
 
-### 5. Configurar .env
-
-```
-# Rede
-NET_IFACE=wlan0   # ou eth0
-
-# E-mail
-EMAIL_USER=seuemail@gmail.com
-EMAIL_PASS=senha_ou_app_password
-EMAIL_TO=destinatario@exemplo.com
-SMTP_SERVER=smtp.gmail.com
-SMTP_PORT=587
-# EMAIL_USE_SSL=1   # se usar porta 465
-
-# GPIO
-RELAY_PIN=17
-```
-
-### 6. Lista de MACs (mac.txt)
-
-```
-02:AB:CD:EF:12:01
-02:AB:CD:EF:12:02
-02:AB:CD:EF:12:03
-02:AB:CD:EF:12:04
-02:AB:CD:EF:12:05
-02:AB:CD:EF:12:06
-02:AB:CD:EF:12:07
-02:AB:CD:EF:12:08
-02:AB:CD:EF:12:09
-02:AB:CD:EF:12:10
-```
----
-
-## ▶️ Uso
-### Testar manualmente
-
-#### 1. Rodar apenas **1 ciclo** e sair
+### Usando CMake
 
 ```bash
-cd /home/pi/speedtest
-source .venv/bin/activate
-python3 monitor.py --once
+mkdir -p build
+cd build
+cmake ..
+cmake --build .
 ```
 
-* Troca o MAC → testa ping → roda Speedtest (Ookla + JS) → envia e-mail → reseta modem (se relé ativo)
-* **Sai** após o ciclo. Útil para testes.
-* Antes de rodar este ciclo (ou executar o `test.js` manualmente), garanta que já foi executado `npm install` para instalar as dependências Node.
+O executável `monitor` ficará em `build/`.
 
----
-
-#### 2. Rodar em **loop infinito** (default: 3h entre ciclos)
+### Usando Makefile
 
 ```bash
-python3 monitor.py
+make
 ```
 
-* Faz o mesmo ciclo, mas **aguarda 3 horas (10800 segundos)** e repete indefinidamente.
-* Ideal para produção, quando rodando como serviço.
+O executável `monitor` será gerado na raiz do projeto.
 
----
+## Uso
 
-#### 3. Rodar 1 ciclo **sem usar o relé**
+Execute o binário com privilégios de root (para trocar MAC e acessar GPIO):
 
 ```bash
-python3 monitor.py --no-relay --once
+sudo ./monitor --once
 ```
 
-* Faz todos os testes (MAC, ping, speedtests, e-mail).
-* **Não aciona GPIO** para reset do modem.
-* Sai no final (como `--once`).
+Opções disponíveis:
 
----
+- `--once`: executa um único ciclo.
+- `--no-relay`: desativa o acionamento do relé.
+- `--relay-pin <BCM>`: define o pino BCM utilizado (padrão: 17).
+- `--relay-delay-seconds <segundos>`: tempo em segundos com o relé ativo.
+- `--cooldown-seconds <segundos>`: intervalo entre ciclos no modo contínuo (padrão: 3 horas).
+- `--js <caminho>` e `--json <caminho>`: caminhos para o script JS e arquivo de saída.
 
-#### 4. Alterar o intervalo entre ciclos
-
-```bash
-python3 monitor.py --cooldown-seconds 600
-```
-
-* Faz o loop infinito, mas espera **600 segundos (10 minutos)** em vez de 3 horas.
-* Bom para debugging/testes mais rápidos.
-
----
-
-⚠️ Observações importantes:
-
-* Sempre ative o ambiente virtual antes (`source .venv/bin/activate`), a não ser que esteja rodando via **systemd**, que já chama o Python dentro da venv.
-* Se você rodar manualmente em SSH e trocar o **MAC da interface Wi-Fi (`wlan0`)**, pode perder a conexão — por isso recomendo testar primeiro com `--once` local, no HDMI/teclado.
-
----
-
-## 🛠️ Rodar como serviço (systemd)
-
-### 1. Instalar automaticamente o serviço
-O script ```install_speedtest_service.sh``` cria o arquivo de unit, ativa e inicia:
-
-```
-chmod +x install_speedtest_service.sh
-./install_speedtest_service.sh
-```
-
-### 2. Comandos úteis
-
-Ver status:
-```
-systemctl status speedtest-monitor
-```
-
-Logs em tempo real:
-```
-journalctl -u speedtest-monitor -f -n 50
-```
-
-Parar / iniciar:
-```
-sudo systemctl stop speedtest-monitor
-sudo systemctl start speedtest-monitor
-```
-## ⚡ Notas Importantes
-
-O serviço roda como root para poder trocar o MAC (CAP_NET_ADMIN).
-
-Trocar MAC derruba a rede por alguns segundos; o script espera até 90s o ping voltar.
-
-Se usar Wi-Fi (wlan0), certifique-se que o NetworkManager não sobrescreve o MAC.
-
-Se usar Ethernet (eth0), pode ser necessário renovar DHCP (o script já tenta esperar a rede voltar).
-
-Teste primeiro com --once localmente (HDMI/teclado) antes de depender só do SSH, pois você pode perder a sessão durante a troca de MAC.
-
-## ✅ Checklist rápido
-
-Configurar .env (interface, e-mail, GPIO).
-
-Popular mac.txt com 10 MACs.
-
-Testar: python3 monitor.py --once.
-
-Instalar serviço: ./install_speedtest_service.sh.
-
-Verificar logs: journalctl -u speedtest-monitor -f -n 50.
-
-
----
-
-👉 Quer que eu já inclua no `install_speedtest_service.sh` a opção de receber **argumentos extras** (por ex. `--cooldown-seconds 600 --relay-pin 23`) e gravar direto no `ExecStart` do unit file?
+O programa registra logs em `connection_log.csv`, atualiza `mac_index.txt` com o próximo MAC e envia um resumo por e-mail com os anexos disponíveis.
