@@ -412,8 +412,8 @@ def summarize_ookla(d):
     ping = d.get("ping", {}).get("latency")
     dl_bw = d.get("download", {}).get("bandwidth")   # bytes/s (depende versão)
     ul_bw = d.get("upload", {}).get("bandwidth")
-    dl_mbps = (dl_bw or 0) / 1e6
-    ul_mbps = (ul_bw or 0) / 1e6
+    dl_mbps = (dl_bw or 0) / 125000
+    ul_mbps = (ul_bw or 0) / 125000
     srv = d.get("server", {}).get("host")
     return f"Servidor: {srv}\nPing: {ping} ms\nDownload (bandwidth): {dl_mbps:.2f} Mbps\nUpload (bandwidth): {ul_mbps:.2f} Mbps"
 
