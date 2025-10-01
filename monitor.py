@@ -451,23 +451,21 @@ def main():
     if not args.no_relay:
         gpio_ready = maybe_setup_gpio(args.relay_pin)
     if gpio_ready and GPIO:
-#----------------> @@@Alterado 28/09
-#"Reset" GPIO - limpa e monta - Solucao para disparo do rele no "start"
+        #----------------> @@@Alterado 28/09
+        #"Reset" GPIO - limpa e monta - Solucao para disparo do rele no "start"
         GPIO.cleanup()
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(args.relay_pin, GPIO.OUT)
-#<---------------------------------##
+    #<---------------------------------##
     js_path = Path(args.js)
     result_json_path = Path(args.json)
 
     while True:
         if gpio_ready and GPIO and not args.no_relay:
-#----------------> @@@Alterado 28/09
-#"Limpa" GPIO - Desliga o rele (Reativa ONT)
+        #----------------> @@@Alterado 28/09
+        #"Limpa" GPIO - Desliga o rele (Reativa ONT)
             GPIO.cleanup()
-#Espera xx tempo reinicializacao ONT
-        time.sleep(180)
-#<---------------------------------##
+
         # 1) Rotação de MAC
         mac = get_next_mac()
         if mac:
@@ -480,7 +478,30 @@ def main():
         reports = []
         reports.append(perform_speed_tests("Teste após MAC", mac, js_path, result_json_path))
 
-        # 3) Reset modem (mantido)
+        # 3) Intervalo
+        attachments = []
+        if OOKLA_JSON.exists(): attachments.append(OOKLA_JSON)
+        if result_json_path.exists(): attachments.append(result_json_path)
+        rcsv = HERE / "results.csv"
+        if rcsv.exists(): attachments.append(rcsv)
+        if LOG_FILE.exists(): attachments.append(LOG_FILE)
+
+        # Enviar email
+        body_sections = []
+        for report in reports:
+            body_sections.append(report["body_text"])
+            body_sections.append("")
+        body_sections.append("🗒️ Entradas adicionadas ao arquivo connection_log.csv:")
+        for report in reports:
+            body_sections.append(f"- {report['timestamp']} | {report['log_result']}")
+
+        try:
+            send_email("Relatório de Teste de Conexão (Raspberry)", "\n".join(body_sections).strip(), attachments)
+            print("✉️  Email enviado.")
+        except Exception as e:
+            print(f"❌ Falha enviando email: {e}")
+
+        # 4) Reset modem (mantido)
         if gpio_ready and GPIO and not args.no_relay:
             GPIO.setmode(GPIO.BCM)
             GPIO.setup(args.relay_pin, GPIO.OUT)
@@ -499,30 +520,6 @@ def main():
                 print("✅ Conectividade restabelecida após reset.")
             else:
                 print("⚠️  Conectividade não voltou no tempo esperado após reset.")
-
-            # (sem novo bloco de testes pós-reset)
-
-        # 4) Intervalo
-        attachments = []
-        if OOKLA_JSON.exists(): attachments.append(OOKLA_JSON)
-        if result_json_path.exists(): attachments.append(result_json_path)
-        rcsv = HERE / "results.csv"
-        if rcsv.exists(): attachments.append(rcsv)
-        if LOG_FILE.exists(): attachments.append(LOG_FILE)
-
-        body_sections = []
-        for report in reports:
-            body_sections.append(report["body_text"])
-            body_sections.append("")
-        body_sections.append("🗒️ Entradas adicionadas ao arquivo connection_log.csv:")
-        for report in reports:
-            body_sections.append(f"- {report['timestamp']} | {report['log_result']}")
-
-        try:
-            send_email("Relatório de Teste de Conexão (Raspberry)", "\n".join(body_sections).strip(), attachments)
-            print("✉️  Email enviado.")
-        except Exception as e:
-            print(f"❌ Falha enviando email: {e}")
 
         if args.once:
             break
