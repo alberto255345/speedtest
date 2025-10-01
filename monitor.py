@@ -444,19 +444,21 @@ def main():
     gpio_ready = False
     if not args.no_relay:
         gpio_ready = maybe_setup_gpio(args.relay_pin)
+    if gpio_ready and GPIO:
 #----------------> @@@Alterado 28/09
 #"Reset" GPIO - limpa e monta - Solucao para disparo do rele no "start"
-    GPIO.cleanup()
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(17, GPIO.OUT)
+        GPIO.cleanup()
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(args.relay_pin, GPIO.OUT)
 #<---------------------------------##
     js_path = Path(args.js)
     result_json_path = Path(args.json)
 
     while True:
+        if gpio_ready and GPIO and not args.no_relay:
 #----------------> @@@Alterado 28/09
 #"Limpa" GPIO - Desliga o rele (Reativa ONT)
-        GPIO.cleanup()
+            GPIO.cleanup()
 #Espera xx tempo reinicializacao ONT
         time.sleep(180)
 #<---------------------------------##
@@ -473,9 +475,9 @@ def main():
         reports.append(perform_speed_tests("Teste após MAC", mac, js_path, result_json_path))
 
         # 3) Reset modem (mantido)
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(17, GPIO.OUT)
-        if gpio_ready and not args.no_relay:
+        if gpio_ready and GPIO and not args.no_relay:
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(args.relay_pin, GPIO.OUT)
             print("🔄 Resetando modem via relé ...")
             try:
                 acionou = reset_modem(args.relay_pin, pulse_seconds=float(max(args.relay_delay_seconds, 0)), active_high=True)
