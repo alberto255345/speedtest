@@ -304,7 +304,9 @@ def perform_speed_tests(label: str, mac: str, js_path: Path, result_json_path: P
             ul_bw = ookla.get("upload", {}).get("bandwidth")
             dl_mbps = (dl_bw or 0) / 125000
             ul_mbps = (ul_bw or 0) / 125000
-            log_parts.append(f"Ookla DL {dl_mbps:.2f} UL {ul_mbps:.2f}")
+            latency_ms = ookla.get("ping", {}).get("latency")
+            jitter_ms = ookla.get("ping", {}).get("jitter")
+            log_parts.append(f"Ookla DL {dl_mbps:.2f} UL {ul_mbps:.2f} Lat {latency_ms:.2f} Jit {jitter_ms:.2f}")
         else:
             log_parts.append("Ookla erro")
 
@@ -317,8 +319,10 @@ def perform_speed_tests(label: str, mac: str, js_path: Path, result_json_path: P
         if isinstance(js_data, dict) and "error" not in js_data:
             dl_js = js_data.get("download_mbps")
             ul_js = js_data.get("upload_mbps")
+            latency_js = js_data.get("latency_ms")
+            jitter_js = js_data.get("jitter_ms")
             if isinstance(dl_js, (int, float)) and isinstance(ul_js, (int, float)):
-                log_parts.append(f"JS DL {dl_js:.2f} UL {ul_js:.2f}")
+                log_parts.append(f"JS DL {dl_js:.2f} UL {ul_js:.2f} Lat {latency_js:.2f} Jit {jitter_js:.2f}")
             else:
                 log_parts.append("JS dados incompletos")
         else:
