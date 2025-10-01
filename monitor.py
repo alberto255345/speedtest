@@ -302,8 +302,8 @@ def perform_speed_tests(label: str, mac: str, js_path: Path, result_json_path: P
         if isinstance(ookla, dict) and "error" not in ookla:
             dl_bw = ookla.get("download", {}).get("bandwidth")
             ul_bw = ookla.get("upload", {}).get("bandwidth")
-            dl_mbps = (dl_bw or 0) / 1e6
-            ul_mbps = (ul_bw or 0) / 1e6
+            dl_mbps = (dl_bw or 0) / 125000
+            ul_mbps = (ul_bw or 0) / 125000
             log_parts.append(f"Ookla DL {dl_mbps:.2f} UL {ul_mbps:.2f}")
         else:
             log_parts.append("Ookla erro")
@@ -354,11 +354,11 @@ def send_email(subject, body, attachments=None):
     SMTP_PORT   = int(os.getenv("SMTP_PORT", "587"))
     USE_SSL     = os.getenv("EMAIL_USE_SSL", "0") in ("1", "true", "True")
 
-    if not (EMAIL_USER and EMAIL_PASS and EMAIL_TO):
-        raise RuntimeError("EMAIL_USER/EMAIL_PASS/EMAIL_TO ausentes no .env")
+    if not EMAIL_TO:
+        raise RuntimeError("EMAIL_TO ausente no .env")
 
     msg = MIMEMultipart()
-    msg["From"] = EMAIL_USER
+    msg["From"] = EMAIL_USER or "noreply@test.local"
     msg["To"] = EMAIL_TO
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain", "utf-8"))
@@ -377,13 +377,19 @@ def send_email(subject, body, attachments=None):
 
     if USE_SSL:
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as s:
-            s.login(EMAIL_USER, EMAIL_PASS)
-            s.sendmail(EMAIL_USER, [EMAIL_TO], msg.as_string())
+            if EMAIL_USER and EMAIL_PASS and EMAIL_USER.lower() != "null":
+                s.login(EMAIL_USER, EMAIL_PASS)
+            s.sendmail(msg["From"], [EMAIL_TO], msg.as_string())
     else:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
-            s.starttls()
-            s.login(EMAIL_USER, EMAIL_PASS)
-            s.sendmail(EMAIL_USER, [EMAIL_TO], msg.as_string())
+            try:
+                s.starttls()
+            except Exception:
+                pass
+            if EMAIL_USER and EMAIL_PASS and EMAIL_USER.lower() != "null":
+                s.login(EMAIL_USER, EMAIL_PASS)
+            s.sendmail(msg["From"], [EMAIL_TO], msg.as_string())
+
 
 # ================== RELÉ ==================
 def reset_modem(relay_pin: int, pulse_seconds: float = 2.0, active_high: bool = True):
@@ -440,7 +446,7 @@ def main():
     args = ap.parse_args()
 
     _write_pidfile()
-    
+
     gpio_ready = False
     if not args.no_relay:
         gpio_ready = maybe_setup_gpio(args.relay_pin)
