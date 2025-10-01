@@ -83,15 +83,22 @@ async function fetchHead(url, to=SINGLE_REQ_TIMEOUT_MS, label="HEAD"){
   }, to, label);
 }
 
+/* ===== ALTERAÇÃO NECESSÁRIA: contabilizar bytes parciais em caso de abort/erro ===== */
 async function fetchAndCountBytes(url, opts={}, to=SINGLE_REQ_TIMEOUT_MS, label="GET"){
   return withTimeout(async (signal)=>{
     const res = await fetch(url, { ...opts, headers: { ...COMMON_HEADERS, ...(opts.headers||{}) }, signal });
     if (!res.ok) throw new Error(`${label} HTTP ${res.status}`);
-    return new Promise((resolve, reject)=>{
+    return new Promise((resolve)=>{
       let total = 0;
+      let settled = false;
+      const finish = ()=>{ if (!settled) { settled = true; resolve(total); } };
+
       res.body.on("data", chunk => { total += chunk.length; });
-      res.body.on("end", ()=> resolve(total));
-      res.body.on("error", reject);
+      res.body.on("end",  finish);
+      // em erro/abort/close resolvemos com o parcial (não rejeita)
+      res.body.on("error", finish);
+      res.body.on?.("aborted", finish);
+      res.body.on("close", finish);
     });
   }, to, label);
 }
